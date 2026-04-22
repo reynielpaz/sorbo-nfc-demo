@@ -1,4 +1,4 @@
-const REALTIME_MODEL = 'gpt-4o-realtime-preview-2025-06-03';
+const REALTIME_MODEL = 'gpt-realtime';
 
 const SYSTEM_PROMPT = `Eres el asistente de voz de Sorbo Café • Bistró, ubicado en el Centro Comercial Las Auroras, frente a la Plaza Bolívar, Los Puertos de Altagracia, Zulia, Venezuela.
 
@@ -27,27 +27,38 @@ export async function GET() {
   }
 
   try {
-    const res = await fetch('https://api.openai.com/v1/realtime/sessions', {
+    const res = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: REALTIME_MODEL,
-        voice: 'marin',
-        instructions: SYSTEM_PROMPT,
-        modalities: ['audio', 'text'],
-        turn_detection: {
-          type: 'semantic_vad',
-          eagerness: 'medium',
+        session: {
+          type: 'realtime',
+          model: REALTIME_MODEL,
+          instructions: SYSTEM_PROMPT,
+          output_modalities: ['audio'],
+          audio: {
+            input: {
+              turn_detection: {
+                type: 'semantic_vad',
+                eagerness: 'medium',
+                create_response: true,
+                interrupt_response: true,
+              },
+            },
+            output: {
+              voice: 'marin',
+            },
+          },
         },
       }),
     });
 
     if (!res.ok) {
       const body = await res.text();
-      console.error('OpenAI session error:', res.status, body);
+      console.error('OpenAI client secret error:', res.status, body);
       return Response.json({ error: `OpenAI error ${res.status}` }, { status: 502 });
     }
 

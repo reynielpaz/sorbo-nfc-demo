@@ -330,9 +330,8 @@ function useRealtimeVoice() {
       const session = await sessionRes.json();
       if (session.error) throw new Error(session.error);
 
-      const ephemeralKey = session.client_secret?.value;
+      const ephemeralKey = session.value;
       if (!ephemeralKey) throw new Error('Token de sesión inválido');
-      const model = session.model || 'gpt-4o-realtime-preview-2025-06-03';
 
       // 2. Set up WebRTC peer connection
       const pc = new RTCPeerConnection();
@@ -424,7 +423,7 @@ function useRealtimeVoice() {
       });
 
       // 8. Exchange SDP with OpenAI — browser auth uses ephemeral key, not OPENAI_API_KEY
-      const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=${model}`, {
+      const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${ephemeralKey}`,
