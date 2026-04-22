@@ -8,7 +8,7 @@ export async function POST(request) {
     if (!text || !process.env.OPENAI_API_KEY) {
       return new Response('Missing text or API key', { status: 400 });
     }
-    const cleanText = text.replace(/\*\*/g, '').replace(/\*/g, '').replace(/#{1,6}\s/g, '').replace(/`/g, '');
+    const cleanText = text.replace(/\*\*/g, '').replace(/\*/g, '').replace(/#{1,6}\s/g, '').replace(/`/g, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
     const mp3 = await openai.audio.speech.create({
       model: 'tts-1',
       voice: 'nova',
