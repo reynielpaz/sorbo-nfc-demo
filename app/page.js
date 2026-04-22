@@ -99,6 +99,16 @@ const MENU = {
 const CATEGORIES = Object.keys(MENU);
 // Legacy greeting kept for reference
 const GREETING = 'Hola! Bienvenido a Sorbo Café Bistró. Soy tu asistente personal. Puedo ayudarte a elegir del menú, contarte sobre cualquier plato, o armar tu pedido. Qué se te antoja hoy?';
+const REALTIME_MIC_CONSTRAINTS = {
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  },
+};
+const REALTIME_IDLE_TIMEOUT_MS = 20000;
+const REALTIME_AUTO_CLOSE_AFTER_AUDIO_MS = 350;
+const REALTIME_FINAL_SUMMARY_CLOSE_MS = 6000;
 
 // ─── LEGACY: TTS HOOK (kept, not used in main flow) ──────────
 function useTTS() {
@@ -299,9 +309,129 @@ function useRealtimeVoice() {
   const audioElRef = useRef(null);
   const streamRef = useRef(null);
   const startingRef = useRef(false);
+  const micMutedRef = useRef(false);
+  const assistantSpeakingRef = useRef(false);
+  const micRestoreTimerRef = useRef(null);
+  const idleTimerRef = useRef(null);
+  const autoCloseTimerRef = useRef(null);
+  const sessionTokenRef = useRef(0);
+  const closingReasonRef = useRef('');
+  const pendingCloseReasonRef = useRef('');
+  const pendingSummaryCloseRef = useRef(false);
+
+  const clearMicRestoreTimer = useCallback(() => {
+    if (micRestoreTimerRef.current) {
+      clearTimeout(micRestoreTimerRef.current);
+      micRestoreTimerRef.current = null;
+    }
+  }, []);
+
+  const clearIdleTimer = useCallback(() => {
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+  }, []);
+
+  const clearAutoCloseTimer = useCallback(() => {
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current);
+      autoCloseTimerRef.current = null;
+    }
+  }, []);
+
+  const isCurrentSessionToken = useCallback((token) => token === sessionTokenRef.current, []);
+
+  const disposeSessionArtifacts = useCallback((pc, dc, stream, audioEl) => {
+    if (dc) { try { dc.close(); } catch {} }
+    if (pc) { try { pc.close(); } catch {} }
+    if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch {} }
+    if (audioEl) {
+      try { audioEl.pause(); audioEl.srcObject = null; } catch {}
+    }
+  }, []);
+
+  const normalizeRealtimeText = useCallback((value = '') => value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim(), []);
+
+  const isFinalIntentTranscript = useCallback((value = '') => {
+    const normalized = normalizeRealtimeText(value);
+    if (!normalized) return false;
+    const finalIntentPhrases = [
+      'solamente eso',
+      'solo eso',
+      'eso seria todo',
+      'eso es todo',
+      'nada mas',
+      'mas nada',
+      'ya solamente eso',
+      'ok solamente eso',
+      'ya termine',
+    ];
+    if (finalIntentPhrases.some((phrase) => normalized.includes(phrase))) {
+      return true;
+    }
+    return ['gracias', 'muchas gracias', 'listo', 'ok listo', 'bueno listo', 'dale listo'].includes(normalized);
+  }, [normalizeRealtimeText]);
+
+  const isFinalOrderSummaryTranscript = useCallback((value = '') => {
+    const normalized = normalizeRealtimeText(value);
+    if (!normalized) return false;
+
+    const directPatterns = [
+      /tu (pedido|orden) (queda|quedo|quedaria|seria|incluye|esta|estaria)/,
+      /(pedido|orden) (confirmado|confirmada|anotado|anotada)/,
+      /queda asi tu (pedido|orden)/,
+      /resumen de tu (pedido|orden)/,
+    ];
+
+    if (directPatterns.some((pattern) => pattern.test(normalized))) {
+      return true;
+    }
+
+    const hasOrderTerm = /(pedido|orden)/.test(normalized);
+    const hasSummaryTerm = /(queda|quedo|quedaria|seria|incluye|confirmad|anotad|listo)/.test(normalized);
+    return hasOrderTerm && hasSummaryTerm;
+  }, [normalizeRealtimeText]);
+
+  const logRealtimeEvent = useCallback((type, details) => {
+    if (details === undefined) {
+      console.log(`[realtime] ${type}`);
+      return;
+    }
+    console.log(`[realtime] ${type}`, details);
+  }, []);
+
+  const setMicMuted = useCallback((muted, reason) => {
+    const stream = streamRef.current;
+    if (!stream) return;
+
+    const tracks = stream.getAudioTracks();
+    if (!tracks.length) return;
+
+    tracks.forEach((track) => {
+      track.enabled = !muted;
+    });
+
+    micMutedRef.current = muted;
+    console.log(`[realtime] mic.${muted ? 'muted' : 'unmuted'} (${reason})`);
+  }, []);
 
   const cleanup = useCallback(() => {
+    sessionTokenRef.current += 1;
     startingRef.current = false;
+    clearMicRestoreTimer();
+    clearIdleTimer();
+    clearAutoCloseTimer();
+    assistantSpeakingRef.current = false;
+    micMutedRef.current = false;
+    pendingCloseReasonRef.current = '';
+    pendingSummaryCloseRef.current = false;
     if (dcRef.current) { try { dcRef.current.close(); } catch {} dcRef.current = null; }
     if (pcRef.current) { try { pcRef.current.close(); } catch {} pcRef.current = null; }
     if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
@@ -309,82 +439,287 @@ function useRealtimeVoice() {
       try { audioElRef.current.pause(); audioElRef.current.srcObject = null; } catch {}
       audioElRef.current = null;
     }
-  }, []);
+  }, [clearAutoCloseTimer, clearIdleTimer, clearMicRestoreTimer]);
 
-  const stop = useCallback(() => {
+  const stopSession = useCallback((reason = 'manual stop') => {
+    closingReasonRef.current = reason;
+    console.log(`[realtime] session.close (${reason})`);
     cleanup();
     setStatus('idle');
     setErrorMsg('');
   }, [cleanup]);
 
+  const scheduleIdleTimeout = useCallback((source = 'activity') => {
+    clearIdleTimer();
+    if (!pcRef.current && !startingRef.current) return;
+
+    idleTimerRef.current = setTimeout(() => {
+      if (assistantSpeakingRef.current) {
+        console.log('[realtime] idle timeout deferred while assistant is speaking');
+        scheduleIdleTimeout('assistant-speaking');
+        return;
+      }
+      stopSession('idle timeout');
+    }, REALTIME_IDLE_TIMEOUT_MS);
+
+    console.log(`[realtime] idle.timeout.reset (${source})`);
+  }, [clearIdleTimer, stopSession]);
+
+  const scheduleSessionClose = useCallback((reason, delayMs) => {
+    clearAutoCloseTimer();
+    clearIdleTimer();
+    console.log(`[realtime] session.close.scheduled (${reason}, ${delayMs}ms)`);
+    autoCloseTimerRef.current = setTimeout(() => {
+      stopSession(reason);
+    }, delayMs);
+  }, [clearAutoCloseTimer, clearIdleTimer, stopSession]);
+
+  const muteMicForAssistant = useCallback((reason) => {
+    clearMicRestoreTimer();
+    assistantSpeakingRef.current = true;
+    if (!micMutedRef.current) {
+      setMicMuted(true, reason);
+    }
+  }, [clearMicRestoreTimer, setMicMuted]);
+
+  const restoreMicAfterAssistant = useCallback((reason) => {
+    clearMicRestoreTimer();
+    assistantSpeakingRef.current = false;
+    if (micMutedRef.current) {
+      setMicMuted(false, reason);
+    }
+    if (pcRef.current) {
+      setStatus('listening');
+    }
+  }, [clearMicRestoreTimer, setMicMuted]);
+
+  const scheduleMicRestore = useCallback((reason, delayMs = 320) => {
+    clearMicRestoreTimer();
+    console.log(`[realtime] mic.unmute.scheduled (${reason}, ${delayMs}ms)`);
+    micRestoreTimerRef.current = setTimeout(() => {
+      restoreMicAfterAssistant(reason);
+    }, delayMs);
+  }, [clearMicRestoreTimer, restoreMicAfterAssistant]);
+
+  const stop = useCallback(() => {
+    stopSession('manual stop');
+  }, [stopSession]);
+
+  const createClientSecret = useCallback(async () => {
+    const sessionRes = await fetch('/api/session', {
+      method: 'POST',
+      cache: 'no-store',
+    });
+
+    let session = null;
+    try {
+      session = await sessionRes.json();
+    } catch {}
+
+    if (!sessionRes.ok) throw new Error(session?.error || 'No se pudo crear la sesión de voz');
+    if (session?.error) throw new Error(session.error);
+    if (!session?.value) throw new Error('Token de sesión inválido');
+
+    return session.value;
+  }, []);
+
   const start = useCallback(async () => {
     if (startingRef.current || pcRef.current) return;
+    const sessionToken = sessionTokenRef.current + 1;
+    sessionTokenRef.current = sessionToken;
     startingRef.current = true;
+    closingReasonRef.current = '';
+    pendingCloseReasonRef.current = '';
+    pendingSummaryCloseRef.current = false;
+    clearAutoCloseTimer();
+    clearIdleTimer();
     setStatus('connecting');
     setErrorMsg('');
 
     try {
-      // 1. Get ephemeral token from our server (OPENAI_API_KEY never leaves server)
-      const sessionRes = await fetch('/api/session');
-      if (!sessionRes.ok) throw new Error('No se pudo crear la sesión de voz');
-      const session = await sessionRes.json();
-      if (session.error) throw new Error(session.error);
+      const isSessionActive = () => isCurrentSessionToken(sessionToken) && !closingReasonRef.current;
 
-      const ephemeralKey = session.value;
-      if (!ephemeralKey) throw new Error('Token de sesión inválido');
+      // 1. Request microphone before minting a short-lived client secret.
+      const stream = await navigator.mediaDevices.getUserMedia(REALTIME_MIC_CONSTRAINTS);
+      if (!isSessionActive()) {
+        disposeSessionArtifacts(null, null, stream, null);
+        return;
+      }
+      streamRef.current = stream;
 
-      // 2. Set up WebRTC peer connection
+      // 2. Set up WebRTC peer connection.
       const pc = new RTCPeerConnection();
+      if (!isSessionActive()) {
+        disposeSessionArtifacts(pc, null, stream, null);
+        return;
+      }
       pcRef.current = pc;
 
-      // 3. Remote audio element for model output
+      // 3. Remote audio element for model output.
       const audioEl = new Audio();
       audioEl.autoplay = true;
       audioElRef.current = audioEl;
       pc.ontrack = (e) => {
+        if (!isSessionActive()) return;
         if (e.track.kind === 'audio' && audioElRef.current) {
-          audioElRef.current.srcObject = e.streams[0];
-          audioElRef.current.play().catch(() => {});
+          if (audioElRef.current.srcObject !== e.streams[0]) {
+            audioElRef.current.srcObject = e.streams[0];
+          }
+          if (audioElRef.current.paused) {
+            audioElRef.current.play().catch(() => {});
+          }
         }
       };
 
-      // 4. Request microphone (only after user gesture — enforced by calling start() on button click)
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
-      // 5. Data channel for events and state
+      // 4. Data channel for events and state.
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
 
       dc.addEventListener('open', () => {
+        if (!isSessionActive()) return;
         startingRef.current = false;
         setStatus('listening');
+        scheduleIdleTimeout('datachannel.open');
       });
 
       dc.addEventListener('message', (e) => {
+        if (!isSessionActive()) return;
         try {
           const evt = JSON.parse(e.data);
           switch (evt.type) {
             case 'session.created':
-            case 'session.updated':
+              logRealtimeEvent('session.created', evt);
               setStatus('listening');
+              scheduleIdleTimeout('session.created');
+              break;
+            case 'session.updated':
+              if (!assistantSpeakingRef.current) {
+                setStatus('listening');
+              }
               break;
             case 'input_audio_buffer.speech_started':
-              // User started speaking — interrupt model if needed
+              logRealtimeEvent('input_audio_buffer.speech_started', evt);
+              if (assistantSpeakingRef.current) {
+                console.log('[realtime] input_audio_buffer.speech_started ignored while assistant is speaking');
+                break;
+              }
+              clearAutoCloseTimer();
+              pendingSummaryCloseRef.current = false;
               setStatus('listening');
+              scheduleIdleTimeout('input_audio_buffer.speech_started');
               break;
-            case 'response.audio.delta':
+            case 'conversation.item.input_audio_transcription.completed':
+              logRealtimeEvent('conversation.item.input_audio_transcription.completed', evt);
+              if (evt.transcript) {
+                const finalIntent = isFinalIntentTranscript(evt.transcript);
+                pendingCloseReasonRef.current = finalIntent ? 'user final intent' : '';
+                pendingSummaryCloseRef.current = false;
+                clearAutoCloseTimer();
+                console.log('[realtime] user.transcript', {
+                  transcript: evt.transcript,
+                  final_intent: finalIntent,
+                });
+                scheduleIdleTimeout('user.transcript');
+              }
+              break;
             case 'response.created':
+              logRealtimeEvent('response.created', evt);
+              clearAutoCloseTimer();
+              pendingSummaryCloseRef.current = false;
+              muteMicForAssistant('response.created');
+              setStatus('speaking');
+              scheduleIdleTimeout('response.created');
+              break;
+            case 'response.output_audio.delta':
+            case 'response.audio.delta':
+              logRealtimeEvent('response.audio.delta', { responseId: evt.response_id });
+              muteMicForAssistant('response.audio.delta');
               setStatus('speaking');
               break;
+            case 'response.output_audio.done':
             case 'response.audio.done':
+              logRealtimeEvent('response.audio.done', evt);
+              break;
+            case 'response.output_audio_transcript.done':
+            case 'response.audio_transcript.done':
+              logRealtimeEvent(evt.type, evt);
+              if (evt.transcript) {
+                const finalSummary = isFinalOrderSummaryTranscript(evt.transcript);
+                if (finalSummary && !pendingCloseReasonRef.current) {
+                  pendingSummaryCloseRef.current = true;
+                }
+                console.log('[realtime] assistant.transcript', {
+                  transcript: evt.transcript,
+                  final_order_summary: finalSummary,
+                });
+              }
+              break;
             case 'response.done':
+              logRealtimeEvent('response.done', evt);
+              {
+                const response = evt.response || {};
+                const usage = response.usage || evt.usage || null;
+                const status = response.status || evt.status || null;
+                const statusDetails = response.status_details || evt.status_details || null;
+                const reason =
+                  statusDetails?.reason ||
+                  statusDetails?.type ||
+                  response.reason ||
+                  evt.reason ||
+                  null;
+                const outputTokens =
+                  usage?.output_tokens ??
+                  usage?.total_output_tokens ??
+                  usage?.output_token_count ??
+                  null;
+                const truncation =
+                  response.truncation ??
+                  evt.truncation ??
+                  statusDetails?.truncation ??
+                  null;
+                const incomplete =
+                  response.incomplete_details ??
+                  evt.incomplete_details ??
+                  statusDetails?.incomplete_details ??
+                  null;
+
+                console.log('[realtime] response.done.summary', {
+                  status,
+                  status_details: statusDetails,
+                  reason,
+                  usage,
+                  output_tokens: outputTokens,
+                  truncation,
+                  incomplete,
+                  finish_reason: response.finish_reason || evt.finish_reason || null,
+                });
+              }
+              break;
             case 'output_audio_buffer.stopped':
-              setStatus('listening');
+              logRealtimeEvent('output_audio_buffer.stopped', evt);
+              scheduleMicRestore('output_audio_buffer.stopped', 320);
+              if (pendingCloseReasonRef.current === 'user final intent') {
+                const closeReason = pendingCloseReasonRef.current;
+                pendingCloseReasonRef.current = '';
+                pendingSummaryCloseRef.current = false;
+                scheduleSessionClose(closeReason, REALTIME_AUTO_CLOSE_AFTER_AUDIO_MS);
+                break;
+              }
+              if (pendingSummaryCloseRef.current) {
+                pendingSummaryCloseRef.current = false;
+                scheduleSessionClose('final order summary', REALTIME_FINAL_SUMMARY_CLOSE_MS);
+                break;
+              }
+              scheduleIdleTimeout('output_audio_buffer.stopped');
               break;
             case 'error':
+              logRealtimeEvent('error', evt.error);
               console.error('Realtime error event:', evt.error);
+              clearAutoCloseTimer();
+              clearIdleTimer();
+              restoreMicAfterAssistant('error');
               setErrorMsg(evt.error?.message || 'Error en la sesión');
               setStatus('error');
               break;
@@ -393,11 +728,19 @@ function useRealtimeVoice() {
       });
 
       dc.addEventListener('error', () => {
+        if (!isSessionActive()) return;
+        if (closingReasonRef.current) return;
+        restoreMicAfterAssistant('datachannel.error');
         setErrorMsg('Error en el canal de datos');
         setStatus('error');
       });
 
       pc.onconnectionstatechange = () => {
+        if (!isSessionActive()) return;
+        if (pc.connectionState === 'closed' && closingReasonRef.current) {
+          console.log(`[realtime] pc.closed (${closingReasonRef.current})`);
+          return;
+        }
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           setErrorMsg('Conexión WebRTC perdida');
           setStatus('error');
@@ -405,49 +748,77 @@ function useRealtimeVoice() {
         }
       };
 
-      // 6. Create SDP offer and set as local description
+      // 5. Prepare the offer first, then mint the client secret right before the SDP POST.
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-
-      // 7. Wait for ICE gathering to complete before sending SDP
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === 'complete') { resolve(); return; }
-        const onStateChange = () => {
-          if (pc.iceGatheringState === 'complete') {
-            pc.removeEventListener('icegatheringstatechange', onStateChange);
-            resolve();
-          }
-        };
-        pc.addEventListener('icegatheringstatechange', onStateChange);
-        setTimeout(resolve, 4000); // safety timeout
-      });
-
-      // 8. Exchange SDP with OpenAI — browser auth uses ephemeral key, not OPENAI_API_KEY
-      const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ephemeralKey}`,
-          'Content-Type': 'application/sdp',
-        },
-        body: pc.localDescription.sdp,
-      });
-
-      if (!sdpRes.ok) {
-        const errBody = await sdpRes.text();
-        throw new Error(`WebRTC handshake error ${sdpRes.status}: ${errBody.slice(0, 120)}`);
+      if (!offer.sdp) {
+        throw new Error('No se pudo preparar la oferta WebRTC');
       }
 
-      // 9. Set remote description with OpenAI's SDP answer
-      const answerSdp = await sdpRes.text();
+      let answerSdp = '';
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const ephemeralKey = await createClientSecret();
+        if (!isSessionActive()) {
+          disposeSessionArtifacts(pc, dc, stream, audioEl);
+          return;
+        }
+        const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${ephemeralKey}`,
+            'Content-Type': 'application/sdp',
+          },
+          body: offer.sdp,
+        });
+
+        if (sdpRes.ok) {
+          answerSdp = await sdpRes.text();
+          break;
+        }
+
+        const errBody = await sdpRes.text();
+        const tokenExpired = sdpRes.status === 401 && /expired/i.test(errBody);
+        if (!tokenExpired || attempt === 1) {
+          throw new Error(`WebRTC handshake error ${sdpRes.status}: ${errBody.slice(0, 120)}`);
+        }
+      }
+
+      if (!answerSdp) {
+        throw new Error('No se pudo completar el handshake WebRTC');
+      }
+
+      // 6. Set remote description with OpenAI's SDP answer.
+      if (!isSessionActive()) {
+        disposeSessionArtifacts(pc, dc, stream, audioEl);
+        return;
+      }
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
     } catch (err) {
+      if (!isCurrentSessionToken(sessionToken)) {
+        return;
+      }
       console.error('Realtime voice error:', err);
       setErrorMsg(err.message || 'No se pudo conectar');
       setStatus('error');
       cleanup();
     }
-  }, [cleanup]);
+  }, [
+    cleanup,
+    clearAutoCloseTimer,
+    clearIdleTimer,
+    createClientSecret,
+    disposeSessionArtifacts,
+    isCurrentSessionToken,
+    isFinalIntentTranscript,
+    isFinalOrderSummaryTranscript,
+    logRealtimeEvent,
+    muteMicForAssistant,
+    restoreMicAfterAssistant,
+    scheduleIdleTimeout,
+    scheduleMicRestore,
+    scheduleSessionClose,
+  ]);
 
   useEffect(() => () => cleanup(), [cleanup]);
 
@@ -594,9 +965,21 @@ function VoiceOrb({ status, onStart, onStop }) {
             background: 'rgba(255,255,255,0.16)', filter: 'blur(8px)',
             pointerEvents: 'none',
           }} />
-          <span style={{ fontSize: 54, position: 'relative', zIndex: 1, filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.5))' }}>
-            ☕
-          </span>
+          <svg
+            width="62"
+            height="62"
+            viewBox="0 0 64 64"
+            fill="none"
+            aria-hidden="true"
+            style={{ position: 'relative', zIndex: 1, filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.5))' }}
+          >
+            <path d="M20 28H41C41 38.4934 35.8513 46 30.5 46C25.1487 46 20 38.4934 20 28Z" stroke="rgba(247,235,213,0.96)" strokeWidth="3" strokeLinejoin="round" />
+            <path d="M41 30H45.5C49.6421 30 53 33.3579 53 37.5C53 41.6421 49.6421 45 45.5 45H42" stroke="rgba(247,235,213,0.96)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+            <path d="M17 50H47" stroke="rgba(247,235,213,0.96)" strokeWidth="3" strokeLinecap="round" />
+            <path d="M24 15C24 18 21.5 19.5 21.5 22.5C21.5 24.5 22.5 25.8 24 27" stroke="rgba(247,235,213,0.88)" strokeWidth="2.6" strokeLinecap="round" />
+            <path d="M31 12C31 15.5 28.5 17.2 28.5 20.4C28.5 22.5 29.6 24.2 31 25.6" stroke="rgba(247,235,213,0.94)" strokeWidth="2.6" strokeLinecap="round" />
+            <path d="M38 15C38 18 35.5 19.4 35.5 22.1C35.5 24.1 36.5 25.5 38 26.9" stroke="rgba(247,235,213,0.8)" strokeWidth="2.6" strokeLinecap="round" />
+          </svg>
         </div>
 
         {/* Speaking: voice bars below orb */}
