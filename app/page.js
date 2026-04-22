@@ -97,9 +97,10 @@ const MENU = {
 };
 
 const CATEGORIES = Object.keys(MENU);
+// Legacy greeting kept for reference
 const GREETING = 'Hola! Bienvenido a Sorbo Café Bistró. Soy tu asistente personal. Puedo ayudarte a elegir del menú, contarte sobre cualquier plato, o armar tu pedido. Qué se te antoja hoy?';
 
-// ─── TTS HOOK ────────────────────────────────────────────────
+// ─── LEGACY: TTS HOOK (kept, not used in main flow) ──────────
 function useTTS() {
   const audioRef = useRef(null);
   const audioUrlRef = useRef(null);
@@ -134,10 +135,7 @@ function useTTS() {
       const audio = new Audio(url);
       audioRef.current = audio;
       audioUrlRef.current = url;
-      audio.onended = () => {
-        cleanupAudio(audio, url);
-        if (onDone) onDone();
-      };
+      audio.onended = () => { cleanupAudio(audio, url); if (onDone) onDone(); };
       audio.onerror = () => { cleanupAudio(audio, url); };
       await audio.play();
     } catch { cleanupAudio(); }
@@ -145,10 +143,7 @@ function useTTS() {
 
   useEffect(() => () => cleanupAudio(), [cleanupAudio]);
 
-  const stop = useCallback(() => {
-    cleanupAudio();
-  }, [cleanupAudio]);
-
+  const stop = useCallback(() => { cleanupAudio(); }, [cleanupAudio]);
   const toggle = useCallback(() => {
     if (isSpeaking) cleanupAudio();
     setVoiceEnabled(v => !v);
@@ -157,7 +152,7 @@ function useTTS() {
   return { speak, stop, toggle, isSpeaking, voiceEnabled };
 }
 
-// ─── CHAT HOOK ───────────────────────────────────────────────
+// ─── LEGACY: CHAT HOOK (kept, not used in main flow) ─────────
 function useChat(tts, panelOpenRef) {
   const [messages, setMessages] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
@@ -201,9 +196,7 @@ function useChat(tts, panelOpenRef) {
     activeRequestIdRef.current = 0;
     const controller = activeControllerRef.current;
     activeControllerRef.current = null;
-    if (controller) {
-      try { controller.abort(); } catch {}
-    }
+    if (controller) { try { controller.abort(); } catch {} }
     isTypingRef.current = false;
     setIsTyping(false);
   }, []);
@@ -234,10 +227,7 @@ function useChat(tts, panelOpenRef) {
     const controller = new AbortController();
     activeControllerRef.current = controller;
     try {
-      const apiMessages = nextMessages.map(m => ({
-        role: m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.text,
-      }));
+      const apiMessages = nextMessages.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text }));
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -287,28 +277,182 @@ function useChat(tts, panelOpenRef) {
       setListening(false);
       if (transcript) send(transcript);
     };
-    recognition.onerror = () => {
-      if (recognitionRef.current === recognition) recognitionRef.current = null;
-      setListening(false);
-    };
-    recognition.onend = () => {
-      if (recognitionRef.current === recognition) recognitionRef.current = null;
-      setListening(false);
-    };
+    recognition.onerror = () => { if (recognitionRef.current === recognition) recognitionRef.current = null; setListening(false); };
+    recognition.onend = () => { if (recognitionRef.current === recognition) recognitionRef.current = null; setListening(false); };
     try { recognition.start(); } catch { recognitionRef.current = null; setListening(false); }
   }, [isTyping, listening, send, stopListening, tts]);
 
   useEffect(() => { startListeningRef.current = startListening; }, [startListening]);
   useEffect(() => () => cancelPendingRequest(), [cancelPendingRequest]);
 
-  const toggleAutoConversation = useCallback(() => {
-    setAutoConversation(v => !v);
+  const toggleAutoConversation = useCallback(() => { setAutoConversation(v => !v); }, []);
+
+  return { messages, isTyping, send, init, listening, autoConversation, toggleAutoConversation, startListeningRef, stopListening, cancelPendingRequest };
+}
+
+// ─── REALTIME VOICE HOOK ──────────────────────────────────────
+function useRealtimeVoice() {
+  const [status, setStatus] = useState('idle'); // idle | connecting | listening | speaking | error
+  const [errorMsg, setErrorMsg] = useState('');
+  const pcRef = useRef(null);
+  const dcRef = useRef(null);
+  const audioElRef = useRef(null);
+  const streamRef = useRef(null);
+  const startingRef = useRef(false);
+
+  const cleanup = useCallback(() => {
+    startingRef.current = false;
+    if (dcRef.current) { try { dcRef.current.close(); } catch {} dcRef.current = null; }
+    if (pcRef.current) { try { pcRef.current.close(); } catch {} pcRef.current = null; }
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    if (audioElRef.current) {
+      try { audioElRef.current.pause(); audioElRef.current.srcObject = null; } catch {}
+      audioElRef.current = null;
+    }
   }, []);
 
-  return {
-    messages, isTyping, send, init, listening, autoConversation,
-    toggleAutoConversation, startListeningRef, stopListening, cancelPendingRequest,
-  };
+  const stop = useCallback(() => {
+    cleanup();
+    setStatus('idle');
+    setErrorMsg('');
+  }, [cleanup]);
+
+  const start = useCallback(async () => {
+    if (startingRef.current || pcRef.current) return;
+    startingRef.current = true;
+    setStatus('connecting');
+    setErrorMsg('');
+
+    try {
+      // 1. Get ephemeral token from our server (OPENAI_API_KEY never leaves server)
+      const sessionRes = await fetch('/api/session');
+      if (!sessionRes.ok) throw new Error('No se pudo crear la sesión de voz');
+      const session = await sessionRes.json();
+      if (session.error) throw new Error(session.error);
+
+      const ephemeralKey = session.client_secret?.value;
+      if (!ephemeralKey) throw new Error('Token de sesión inválido');
+      const model = session.model || 'gpt-4o-realtime-preview-2025-06-03';
+
+      // 2. Set up WebRTC peer connection
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+
+      // 3. Remote audio element for model output
+      const audioEl = new Audio();
+      audioEl.autoplay = true;
+      audioElRef.current = audioEl;
+      pc.ontrack = (e) => {
+        if (e.track.kind === 'audio' && audioElRef.current) {
+          audioElRef.current.srcObject = e.streams[0];
+          audioElRef.current.play().catch(() => {});
+        }
+      };
+
+      // 4. Request microphone (only after user gesture — enforced by calling start() on button click)
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+      // 5. Data channel for events and state
+      const dc = pc.createDataChannel('oai-events');
+      dcRef.current = dc;
+
+      dc.addEventListener('open', () => {
+        startingRef.current = false;
+        setStatus('listening');
+      });
+
+      dc.addEventListener('message', (e) => {
+        try {
+          const evt = JSON.parse(e.data);
+          switch (evt.type) {
+            case 'session.created':
+            case 'session.updated':
+              setStatus('listening');
+              break;
+            case 'input_audio_buffer.speech_started':
+              // User started speaking — interrupt model if needed
+              setStatus('listening');
+              break;
+            case 'response.audio.delta':
+            case 'response.created':
+              setStatus('speaking');
+              break;
+            case 'response.audio.done':
+            case 'response.done':
+            case 'output_audio_buffer.stopped':
+              setStatus('listening');
+              break;
+            case 'error':
+              console.error('Realtime error event:', evt.error);
+              setErrorMsg(evt.error?.message || 'Error en la sesión');
+              setStatus('error');
+              break;
+          }
+        } catch {}
+      });
+
+      dc.addEventListener('error', () => {
+        setErrorMsg('Error en el canal de datos');
+        setStatus('error');
+      });
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          setErrorMsg('Conexión WebRTC perdida');
+          setStatus('error');
+          cleanup();
+        }
+      };
+
+      // 6. Create SDP offer and set as local description
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // 7. Wait for ICE gathering to complete before sending SDP
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') { resolve(); return; }
+        const onStateChange = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', onStateChange);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', onStateChange);
+        setTimeout(resolve, 4000); // safety timeout
+      });
+
+      // 8. Exchange SDP with OpenAI — browser auth uses ephemeral key, not OPENAI_API_KEY
+      const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=${model}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ephemeralKey}`,
+          'Content-Type': 'application/sdp',
+        },
+        body: pc.localDescription.sdp,
+      });
+
+      if (!sdpRes.ok) {
+        const errBody = await sdpRes.text();
+        throw new Error(`WebRTC handshake error ${sdpRes.status}: ${errBody.slice(0, 120)}`);
+      }
+
+      // 9. Set remote description with OpenAI's SDP answer
+      const answerSdp = await sdpRes.text();
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    } catch (err) {
+      console.error('Realtime voice error:', err);
+      setErrorMsg(err.message || 'No se pudo conectar');
+      setStatus('error');
+      cleanup();
+    }
+  }, [cleanup]);
+
+  useEffect(() => () => cleanup(), [cleanup]);
+
+  return { status, errorMsg, start, stop };
 }
 
 // ─── SPLASH ──────────────────────────────────────────────────
@@ -348,7 +492,162 @@ function Splash({ onEnter }) {
   );
 }
 
-// ─── CHAT PANEL ──────────────────────────────────────────────
+// ─── VOICE ORB ────────────────────────────────────────────────
+function VoiceOrb({ status, onStart, onStop }) {
+  const active = status === 'connecting' || status === 'listening' || status === 'speaking';
+
+  const orbAnimation = {
+    idle: 'orb-breathe 3s ease-in-out infinite',
+    connecting: 'orb-breathe 1.5s ease-in-out infinite',
+    listening: 'orb-pulse 1.6s ease-in-out infinite',
+    speaking: 'orb-pulse-strong 0.85s ease-in-out infinite',
+    error: 'orb-shake 0.5s ease',
+  }[status];
+
+  const orbGradient = {
+    idle: `radial-gradient(circle at 35% 30%, ${T.gold}, #5c3d00)`,
+    connecting: `radial-gradient(circle at 35% 30%, ${T.gold}cc, #7a5200)`,
+    listening: `radial-gradient(circle at 35% 30%, ${T.gold}, #6e4800)`,
+    speaking: `radial-gradient(circle at 35% 30%, ${T.amber}, #7a4010)`,
+    error: 'radial-gradient(circle at 35% 30%, #dc4040, #6b1010)',
+  }[status];
+
+  const orbShadow = {
+    idle: `0 0 40px ${T.gold}35, 0 0 80px ${T.gold}12`,
+    connecting: `0 0 50px ${T.gold}55, 0 0 100px ${T.gold}20`,
+    listening: `0 0 55px ${T.gold}65, 0 0 110px ${T.gold}25`,
+    speaking: `0 0 65px ${T.amber}75, 0 0 130px ${T.amber}30`,
+    error: '0 0 40px rgba(220,50,50,0.55), 0 0 80px rgba(220,50,50,0.2)',
+  }[status];
+
+  const statusLabel = {
+    idle: 'Toca para hablar',
+    connecting: 'Conectando...',
+    listening: 'Escuchando...',
+    speaking: 'Respondiendo...',
+    error: 'Error · Toca para reintentar',
+  }[status];
+
+  const statusColor = {
+    idle: T.textSec,
+    connecting: T.gold,
+    listening: T.gold,
+    speaking: T.amber,
+    error: '#ff6b6b',
+  }[status];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0, userSelect: 'none' }}>
+
+      {/* Orb wrapper */}
+      <div
+        style={{ position: 'relative', width: 160, height: 160, cursor: 'pointer' }}
+        onClick={active ? onStop : onStart}
+        role="button"
+        aria-label={active ? 'Detener asistente de voz' : 'Iniciar asistente de voz'}
+      >
+        {/* Ambient glow behind orb */}
+        <div style={{
+          position: 'absolute', inset: -28, borderRadius: '50%',
+          background: status === 'error'
+            ? 'radial-gradient(circle, rgba(220,50,50,0.10), transparent 65%)'
+            : `radial-gradient(circle, ${T.gold}10, transparent 65%)`,
+          animation: active ? 'orb-breathe 2.5s ease-in-out infinite' : 'none',
+          pointerEvents: 'none',
+        }} />
+
+        {/* Connecting: spinning dashed ring */}
+        {status === 'connecting' && (
+          <div style={{
+            position: 'absolute', inset: -6, borderRadius: '50%',
+            border: '2px solid transparent',
+            borderTopColor: T.gold,
+            borderRightColor: `${T.gold}30`,
+            animation: 'orb-spin-ring 1s linear infinite',
+            pointerEvents: 'none',
+          }} />
+        )}
+
+        {/* Listening: expanding wave rings */}
+        {status === 'listening' && [0, 0.6, 1.2].map((delay, i) => (
+          <div key={i} style={{
+            position: 'absolute', inset: 0, borderRadius: '50%',
+            border: `1px solid ${T.gold}45`,
+            animation: `orb-ring 2s ease-out ${delay}s infinite`,
+            pointerEvents: 'none',
+          }} />
+        ))}
+
+        {/* Orb body */}
+        <div style={{
+          width: 160, height: 160, borderRadius: '50%',
+          background: orbGradient,
+          boxShadow: `${orbShadow}, inset 0 0 40px rgba(0,0,0,0.4)`,
+          animation: orbAnimation,
+          transition: 'background 0.5s ease, box-shadow 0.5s ease',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          position: 'relative', overflow: 'hidden',
+        }}>
+          {/* Glass highlight for 3D effect */}
+          <div style={{
+            position: 'absolute', top: '16%', left: '22%',
+            width: '38%', height: '28%', borderRadius: '50%',
+            background: 'rgba(255,255,255,0.16)', filter: 'blur(8px)',
+            pointerEvents: 'none',
+          }} />
+          <span style={{ fontSize: 54, position: 'relative', zIndex: 1, filter: 'drop-shadow(0 2px 6px rgba(0,0,0,0.5))' }}>
+            ☕
+          </span>
+        </div>
+
+        {/* Speaking: voice bars below orb */}
+        {status === 'speaking' && (
+          <div style={{
+            position: 'absolute', bottom: -38, left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex', alignItems: 'flex-end', gap: 4, height: 28,
+            pointerEvents: 'none',
+          }}>
+            {[0, 0.08, 0.16, 0.24, 0.32, 0.24, 0.16, 0.08, 0].map((delay, i) => (
+              <div key={i} style={{
+                width: 4, height: 28, borderRadius: 999,
+                background: `linear-gradient(180deg, ${T.amber}, ${T.gold})`,
+                transformOrigin: 'bottom center',
+                animation: `voice-wave 0.75s ease-in-out ${delay}s infinite`,
+              }} />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Status text */}
+      <p style={{
+        marginTop: status === 'speaking' ? 56 : 24,
+        fontSize: 13, color: statusColor,
+        fontFamily: "'DM Sans', sans-serif",
+        fontWeight: 500, letterSpacing: 0.5,
+        transition: 'color 0.3s, margin-top 0.3s',
+        textAlign: 'center',
+      }}>{statusLabel}</p>
+
+      {/* Explicit stop button when active */}
+      {active && (
+        <button onClick={(e) => { e.stopPropagation(); onStop(); }} style={{
+          marginTop: 16, padding: '9px 28px', borderRadius: 24,
+          border: `1px solid ${T.border}`, background: T.elevated,
+          color: T.textSec, fontSize: 11, fontFamily: "'DM Sans', sans-serif",
+          cursor: 'pointer', letterSpacing: 1.5, textTransform: 'uppercase',
+          fontWeight: 500, transition: 'all 0.2s',
+        }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = T.gold; e.currentTarget.style.color = T.gold; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = T.border; e.currentTarget.style.color = T.textSec; }}
+        >Detener</button>
+      )}
+    </div>
+  );
+}
+
+// ─── LEGACY: CHAT PANEL (kept, not rendered in main flow) ─────
 function ChatPanel({
   open, onClose, messages, onSend, isTyping, tts, listening,
   startListeningRef, onStopListening, autoConversation, onToggleAutoConversation,
@@ -387,7 +686,6 @@ function ChatPanel({
         transition: 'transform 0.4s cubic-bezier(0.16, 1, 0.3, 1)',
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
       }}>
-        {/* Header */}
         <div style={{
           padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           borderBottom: `1px solid ${T.border}`, background: T.card,
@@ -407,7 +705,7 @@ function ChatPanel({
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={onToggleAutoConversation} title={autoConversation ? 'Auto conversación activada' : 'Auto conversación desactivada'} style={{
+            <button onClick={onToggleAutoConversation} style={{
               height: 36, padding: '0 12px', borderRadius: 18,
               background: autoConversation ? `${T.gold}30` : T.elevated,
               border: `1px solid ${autoConversation ? T.gold : T.border}`,
@@ -431,36 +729,10 @@ function ChatPanel({
           </div>
         </div>
 
-        {listening && (
-          <div style={{ padding: '12px 16px 0', flexShrink: 0 }}>
-            <div style={{
-              padding: '14px 16px', borderRadius: 18,
-              background: T.glass, border: `1px solid ${T.goldDim}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14,
-            }}>
-              <div>
-                <p style={{ fontSize: 16, color: T.text, fontWeight: 700 }}>Te escucho...</p>
-                <p style={{ fontSize: 11, color: T.gold, marginTop: 4 }}>Habla con naturalidad. Enviaré tu mensaje al terminar.</p>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 28, flexShrink: 0 }}>
-                {[0, 0.15, 0.3, 0.45].map((delay, i) => (
-                  <span key={i} style={{
-                    width: 5, height: 28, borderRadius: 999,
-                    background: `linear-gradient(180deg, ${T.gold}, ${T.amber})`,
-                    transformOrigin: 'center bottom',
-                    animation: `voice-wave 1s ease-in-out ${delay}s infinite`,
-                  }} />
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Messages */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 8px', display: 'flex', flexDirection: 'column', gap: 12 }}>
           {messages.map((m, i) => (
             <div key={i} style={{ display: 'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start', animation: 'fadeSlideUp 0.3s ease both' }}>
-              <div style={{ maxWidth: '82%', position: 'relative' }}>
+              <div style={{ maxWidth: '82%' }}>
                 <div style={{
                   padding: '12px 16px',
                   borderRadius: m.role === 'user' ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
@@ -469,19 +741,6 @@ function ChatPanel({
                   fontFamily: "'DM Sans', sans-serif", fontSize: 14, lineHeight: 1.6,
                   border: m.role === 'user' ? 'none' : `1px solid ${T.border}`,
                 }}>{m.text}</div>
-                {m.role === 'assistant' && (
-                  <button onClick={() => tts.speak(m.text)} style={{
-                    position: 'absolute', bottom: -6, right: -6,
-                    width: 28, height: 28, borderRadius: '50%',
-                    background: T.elevated, border: `1px solid ${T.border}`,
-                    color: T.textSec, fontSize: 12, cursor: 'pointer',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    opacity: 0.7, transition: 'opacity 0.2s',
-                  }}
-                    onMouseEnter={e => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.color = T.gold; }}
-                    onMouseLeave={e => { e.currentTarget.style.opacity = '0.7'; e.currentTarget.style.color = T.textSec; }}
-                  >🔊</button>
-                )}
               </div>
             </div>
           ))}
@@ -500,7 +759,6 @@ function ChatPanel({
           <div ref={endRef} />
         </div>
 
-        {/* Quick Actions */}
         <div style={{ padding: '8px 16px', display: 'flex', gap: 8, overflowX: 'auto', flexShrink: 0 }}>
           {quickActions.map(q => (
             <button key={q} onClick={() => { if (isTyping) return; onSend(q); }} style={{
@@ -508,31 +766,26 @@ function ChatPanel({
               background: T.glass, color: T.textSec, fontSize: 12,
               fontFamily: "'DM Sans', sans-serif", cursor: 'pointer',
               whiteSpace: 'nowrap', flexShrink: 0, transition: 'all 0.2s',
-            }}
-              onMouseEnter={e => { e.target.style.borderColor = T.gold; e.target.style.color = T.gold; }}
-              onMouseLeave={e => { e.target.style.borderColor = T.border; e.target.style.color = T.textSec; }}
-            >{q}</button>
+            }}>{q}</button>
           ))}
         </div>
 
-        {/* Input */}
         <div style={{
           padding: '12px 16px 24px', display: 'flex', gap: 10, alignItems: 'center',
           borderTop: `1px solid ${T.border}`, background: T.card,
         }}>
-          <button onClick={handleVoice} aria-label={listening ? 'Detener conversación' : 'Activar micrófono'} style={{
+          <button onClick={handleVoice} style={{
             minWidth: listening ? 84 : 42, height: 42, padding: listening ? '0 12px' : 0,
             borderRadius: listening ? 12 : '50%', border: 'none',
             background: listening ? '#D84C4C' : T.elevated, cursor: 'pointer',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: listening ? 11 : 18, flexShrink: 0, color: listening ? '#FFF5F5' : T.textSec,
-            fontWeight: listening ? 700 : 400, letterSpacing: listening ? 0.4 : 0,
-            animation: listening ? 'pulse-glow 1s ease infinite' : 'none',
+            fontWeight: listening ? 700 : 400,
           }}>{listening ? 'Detener' : '🎤'}</button>
           <input ref={inputRef} value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleSend()}
-            placeholder={listening ? 'Te escucho...' : 'Escribe o usa el micrófono...'}
+            placeholder="Escribe o usa el micrófono..."
             style={{
               flex: 1, padding: '12px 18px', borderRadius: 24,
               background: T.elevated, border: `1px solid ${T.border}`,
@@ -587,15 +840,17 @@ function Card({ item, idx, onAsk }) {
         marginTop: 16, paddingTop: 12, borderTop: `1px solid ${T.border}`,
       }}>
         <span style={{ fontSize: 12, color: T.textSec, fontStyle: 'italic' }}>Consultar precio</span>
-        <button onClick={() => onAsk(item)} style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          padding: '6px 14px', borderRadius: 20, background: T.glass,
-          border: `1px solid ${T.border}`, color: T.gold, fontSize: 12,
-          cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s',
-        }}
-          onMouseEnter={e => { e.currentTarget.style.background = T.goldDim; }}
-          onMouseLeave={e => { e.currentTarget.style.background = T.glass; }}
-        >💬 Preguntar</button>
+        {onAsk && (
+          <button onClick={() => onAsk(item)} style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '6px 14px', borderRadius: 20, background: T.glass,
+            border: `1px solid ${T.border}`, color: T.gold, fontSize: 12,
+            cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s',
+          }}
+            onMouseEnter={e => { e.currentTarget.style.background = T.goldDim; }}
+            onMouseLeave={e => { e.currentTarget.style.background = T.glass; }}
+          >🎙 Preguntar</button>
+        )}
       </div>
     </div>
   );
@@ -605,36 +860,22 @@ function Card({ item, idx, onAsk }) {
 export default function Home() {
   const [splash, setSplash] = useState(true);
   const [activeCat, setActiveCat] = useState('hamburguesas');
-  const [chatOpen, setChatOpen] = useState(false);
-  const chatOpenRef = useRef(false);
-  const tts = useTTS();
-  const {
-    messages, isTyping, send, init, listening,
-    autoConversation, toggleAutoConversation, startListeningRef, stopListening, cancelPendingRequest,
-  } = useChat(tts, chatOpenRef);
+  const { status, errorMsg, start, stop } = useRealtimeVoice();
 
-  useEffect(() => {
-    chatOpenRef.current = chatOpen;
-    if (!chatOpen) {
-      stopListening();
-      tts.stop();
-      cancelPendingRequest();
-    }
-  }, [cancelPendingRequest, chatOpen, stopListening, tts]);
-
-  const openChat = useCallback(() => { init(); setChatOpen(true); }, [init]);
-  const askAbout = useCallback((item) => {
-    init(); setChatOpen(true);
-    setTimeout(() => send('Cuéntame más sobre ' + item.name), 400);
-  }, [init, send]);
+  // Clicking "Preguntar" on a card starts the voice session
+  const askAbout = useCallback(() => {
+    if (status === 'idle' || status === 'error') start();
+  }, [start, status]);
 
   const cat = MENU[activeCat];
   if (splash) return <Splash onEnter={() => setSplash(false)} />;
 
   return (
     <div style={{ minHeight: '100vh', background: T.bg, maxWidth: 480, margin: '0 auto', position: 'relative' }}>
+
+      {/* Header */}
       <header style={{ padding: '20px 20px 0', position: 'sticky', top: 0, zIndex: 100, background: T.bg }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
           <div>
             <h1 style={{ fontFamily: "'Playfair Display', serif", fontSize: 28, color: T.gold, fontWeight: 700, letterSpacing: 2 }}>SORBO</h1>
             <p style={{ fontSize: 10, color: T.textSec, letterSpacing: 4, textTransform: 'uppercase', marginTop: 2 }}>Café • Bistró</p>
@@ -645,27 +886,7 @@ export default function Home() {
           </div>
         </div>
 
-        <div onClick={openChat} style={{
-          background: `linear-gradient(135deg, ${T.gold}15, ${T.amber}10)`,
-          border: `1px solid ${T.border}`, borderRadius: 16, padding: 16,
-          marginBottom: 16, display: 'flex', alignItems: 'center', gap: 14, cursor: 'pointer',
-        }}>
-          <div style={{
-            width: 48, height: 48, borderRadius: 14,
-            background: `linear-gradient(135deg, ${T.gold}, ${T.amber})`,
-            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, flexShrink: 0,
-          }}>🤖</div>
-          <div style={{ flex: 1 }}>
-            <p style={{ fontSize: 13, color: T.text, fontWeight: 500 }}>¿Necesitas ayuda para elegir?</p>
-            <p style={{ fontSize: 11, color: T.textSec, marginTop: 4 }}>Asistente con voz IA • Habla o escribe</p>
-          </div>
-          <div style={{
-            padding: '8px 16px', borderRadius: 20,
-            background: `linear-gradient(135deg, ${T.gold}, ${T.amber})`,
-            color: T.bg, fontSize: 12, fontWeight: 600,
-          }}>Hablar</div>
-        </div>
-
+        {/* Category pills */}
         <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 16, marginLeft: -20, marginRight: -20, paddingLeft: 20, paddingRight: 20 }}>
           {CATEGORIES.map(key => (
             <button key={key} onClick={() => setActiveCat(key)} style={{
@@ -684,7 +905,28 @@ export default function Home() {
         </div>
       </header>
 
-      <main style={{ padding: '0 20px 120px' }}>
+      {/* Voice Orb Hero */}
+      <section style={{
+        padding: '36px 20px 40px',
+        display: 'flex', flexDirection: 'column', alignItems: 'center',
+        borderBottom: `1px solid ${T.border}`,
+      }}>
+        <p style={{ fontSize: 11, color: T.textSec, letterSpacing: 3, textTransform: 'uppercase', marginBottom: 40 }}>
+          Asistente de Voz Premium
+        </p>
+        <VoiceOrb status={status} onStart={start} onStop={stop} />
+        {errorMsg && (
+          <p style={{ fontSize: 11, color: '#ff6b6b', marginTop: 16, textAlign: 'center', maxWidth: 280, lineHeight: 1.5 }}>
+            {errorMsg}
+          </p>
+        )}
+        <p style={{ fontSize: 11, color: T.textSec, marginTop: 28, opacity: 0.45, textAlign: 'center' }}>
+          Habla con naturalidad · Pregunta por cualquier plato
+        </p>
+      </section>
+
+      {/* Menu */}
+      <main style={{ padding: '20px 20px 80px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, marginTop: 8 }}>
           <span style={{ fontSize: 28 }}>{cat.icon}</span>
           <div>
@@ -707,32 +949,10 @@ export default function Home() {
         <div style={{ marginTop: 40, textAlign: 'center', paddingBottom: 20 }}>
           <div style={{ width: 40, height: 1, background: `linear-gradient(90deg, transparent, ${T.gold}40, transparent)`, margin: '0 auto 16px' }} />
           <p style={{ fontSize: 10, color: T.textSec, opacity: 0.4 }}>Experiencia digital por OpenSyntheAI</p>
-          <p style={{ fontSize: 9, color: T.textSec, opacity: 0.3, marginTop: 4 }}>NFC + IA • El futuro de la gastronomía digital</p>
+          <p style={{ fontSize: 9, color: T.textSec, opacity: 0.3, marginTop: 4 }}>NFC + IA · El futuro de la gastronomía digital</p>
         </div>
       </main>
 
-      <button onClick={openChat} style={{
-        position: 'fixed', bottom: 24, right: 24, zIndex: 5000,
-        width: 60, height: 60, borderRadius: '50%',
-        background: `linear-gradient(135deg, ${T.gold}, ${T.amber})`,
-        border: 'none', cursor: 'pointer', fontSize: 28,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        boxShadow: `0 8px 32px ${T.gold}50`, animation: 'float-btn 3s ease-in-out infinite',
-      }}>💬</button>
-
-      <ChatPanel
-        open={chatOpen}
-        onClose={() => setChatOpen(false)}
-        messages={messages}
-        onSend={send}
-        isTyping={isTyping}
-        tts={tts}
-        listening={listening}
-        startListeningRef={startListeningRef}
-        onStopListening={stopListening}
-        autoConversation={autoConversation}
-        onToggleAutoConversation={toggleAutoConversation}
-      />
       <style jsx global>{`
         @keyframes voice-wave {
           0%, 100% { transform: scaleY(0.45); opacity: 0.35; }
