@@ -12,18 +12,21 @@ Demo de menú digital con asistente de IA conversacional por voz, diseñado para
 |---|---|
 | Next.js 14 (App Router) | Framework principal |
 | React 18 | UI |
-| OpenAI `gpt-4o-mini` | Asistente conversacional |
-| OpenAI `tts-1` | Síntesis de voz (voz: nova) |
-| Web Speech API | STT nativo de Chrome (sin costo) |
+| OpenAI Realtime API (WebRTC) | Voz conversacional en tiempo real |
+| OpenAI `gpt-4o-realtime-preview` | Modelo realtime (voz: marin) |
+| OpenAI `gpt-4o-mini` | Chat legado (fallback) |
+| OpenAI `tts-1` | TTS legado (fallback) |
 
 ---
 
 ## Funcionalidades actuales
 
 - Menú completo embebido en el prompt del asistente (sin base de datos)
-- Chat con IA especializada en gastronomía y psicología del apetito
-- Voz bidireccional: entrada por micrófono (STT) + respuesta hablada (TTS)
-- API key protegida server-side — nunca expuesta al cliente
+- **Modo realtime (principal):** conversación de voz bidireccional con latencia baja via WebRTC
+- Orbe animado con estados visuales: idle, connecting, listening, speaking, error
+- Turn detection automática con `semantic_vad` — interrupciones naturales
+- API key protegida server-side — el browser solo recibe un token efímero de corta vida
+- Chat + TTS legado conservado en `/api/chat` y `/api/tts`
 - PWA-ready (`manifest.json`)
 
 ---
@@ -34,13 +37,14 @@ Demo de menú digital con asistente de IA conversacional por voz, diseñado para
 sorbo-nfc-demo/
 ├── app/
 │   ├── api/
-│   │   ├── chat/route.js     # Proxy OpenAI chat (gpt-4o-mini)
-│   │   └── tts/route.js      # Proxy OpenAI TTS (tts-1)
+│   │   ├── session/route.js   # Genera token efímero para WebRTC (NUEVO)
+│   │   ├── chat/route.js      # Proxy OpenAI chat legado (gpt-4o-mini)
+│   │   └── tts/route.js       # Proxy OpenAI TTS legado (tts-1)
 │   ├── globals.css
 │   ├── layout.js
-│   └── page.js               # UI principal: menú + asistente IA
+│   └── page.js                # UI voice-first: orbe + menú
 ├── public/
-│   └── manifest.json         # Configuración PWA
+│   └── manifest.json
 ├── .env.example
 ├── next.config.js
 └── package.json
@@ -56,7 +60,7 @@ Copia `.env.example` a `.env.local` y completa con tu clave:
 OPENAI_API_KEY=sk-proj-...
 ```
 
-En Vercel, agrega la misma variable en **Project Settings → Environment Variables**.
+La misma variable sirve para el modo realtime y el chat legado. En Vercel, agrégala en **Project Settings → Environment Variables**.
 
 ---
 
@@ -67,9 +71,27 @@ npm install
 npm run dev
 ```
 
-Abre `http://localhost:3000` en Chrome. El STT por voz requiere Chrome o Edge.
+Abre `http://localhost:3000` en **Chrome o Edge** (WebRTC + getUserMedia requieren contexto seguro o localhost).
 
-Para probar desde el celular en la misma red WiFi, usa la URL `Network` que aparece en la terminal.
+Para probar desde el celular en la misma red WiFi, usa la URL `Network` que aparece en la terminal. El micrófono solo funciona en HTTPS — en producción Vercel lo resuelve automáticamente.
+
+---
+
+## Modo Realtime — cómo funciona
+
+```
+Browser → GET /api/session
+  └─ Server → POST api.openai.com/v1/realtime/sessions (con OPENAI_API_KEY)
+               └─ Devuelve { client_secret: { value: "ephemeral-token" } }
+
+Browser → RTCPeerConnection + getUserMedia (micrófono)
+Browser → DataChannel "oai-events"
+Browser → POST api.openai.com/v1/realtime?model=... (con ephemeral token, SDP offer)
+  └─ OpenAI responde con SDP answer → WebRTC conectado
+  └─ Audio del modelo sale por ontrack → <Audio> element
+```
+
+El `OPENAI_API_KEY` nunca sale del servidor. El token efímero expira automáticamente.
 
 ---
 
@@ -79,15 +101,17 @@ Para probar desde el celular en la misma red WiFi, usa la URL `Network` que apar
 npx vercel --prod
 ```
 
-O importa el repo desde [vercel.com/new](https://vercel.com/new) — Vercel detecta Next.js automáticamente.
+O importa el repo desde [vercel.com/new](https://vercel.com/new) — Vercel detecta Next.js automáticamente. Agrega `OPENAI_API_KEY` en las variables de entorno del proyecto antes del primer deploy.
 
 ---
 
 ## Estado actual / próximos pasos
 
-- [x] Menú estático con asistente IA conversacional
-- [x] Voz bidireccional (STT + TTS)
-- [x] API key protegida server-side
+- [x] Menú estático con asistente IA
+- [x] Modo realtime WebRTC (voz bidireccional de baja latencia)
+- [x] Turn detection automática (`semantic_vad`)
+- [x] API key protegida — token efímero para el browser
+- [x] Orbe animado con estados visuales
 - [ ] Integración NFC real (trigger por tag físico)
 - [ ] Menú dinámico desde CMS o base de datos
 - [ ] Panel de administración para el restaurante
