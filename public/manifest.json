@@ -1,0 +1,10 @@
+{
+  "name": "Sorbo Café • Bistró",
+  "short_name": "Sorbo",
+  "description": "Menú digital con asistente IA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0B0F1A",
+  "theme_color": "#0B0F1A",
+  "icons": []
+}

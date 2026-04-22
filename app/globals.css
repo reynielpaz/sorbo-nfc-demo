@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=DM+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --gold: #D4A853;
+  --gold-dim: #D4A85340;
+  --amber: #E8943A;
+  --bg-deep: #0B0F1A;
+  --bg-card: #131825;
+  --bg-elevated: #1A1F2E;
+  --text-primary: #F5F0E8;
+  --text-secondary: #9A8E7A;
+  --glass: rgba(212, 168, 83, 0.06);
+  --glass-border: rgba(212, 168, 83, 0.15);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: 'DM Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar { display: none; }
+body { scrollbar-width: none; }
+
+input::placeholder { color: var(--text-secondary); opacity: 0.6; }
+
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse-glow {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.05); opacity: 0.8; }
+}
+@keyframes typingDot {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+@keyframes float-btn {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
