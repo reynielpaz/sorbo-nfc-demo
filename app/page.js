@@ -1,6 +1,12 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  applyParsedTurnToDraft,
+  buildMenuItemCatalog,
+  createEmptyOrderDraft,
+  parseOrderDraftTurn,
+} from '../lib/order-draft';
 
 // ─── DESIGN TOKENS ───────────────────────────────────────────
 const T = {
@@ -97,6 +103,7 @@ const MENU = {
 };
 
 const CATEGORIES = Object.keys(MENU);
+const MENU_ITEM_CATALOG = buildMenuItemCatalog(MENU);
 // Legacy greeting kept for reference
 const GREETING = 'Hola! Bienvenido a Sorbo Café Bistró. Soy tu asistente personal. Puedo ayudarte a elegir del menú, contarte sobre cualquier plato, o armar tu pedido. Qué se te antoja hoy?';
 const REALTIME_MIC_CONSTRAINTS = {
@@ -109,6 +116,11 @@ const REALTIME_MIC_CONSTRAINTS = {
 const REALTIME_IDLE_TIMEOUT_MS = 20000;
 const REALTIME_AUTO_CLOSE_AFTER_AUDIO_MS = 350;
 const REALTIME_FINAL_SUMMARY_CLOSE_MS = 6000;
+const REALTIME_MIC_PREWARM_RELEASE_MS = 15000;
+const REALTIME_BARGE_IN_THRESHOLD = 0.09;
+const REALTIME_BARGE_IN_FRAMES = 8;
+const REALTIME_BARGE_IN_MIN_RESPONSE_MS = 250;
+const REALTIME_BARGE_IN_COOLDOWN_MS = 1200;
 
 // ─── LEGACY: TTS HOOK (kept, not used in main flow) ──────────
 function useTTS() {
@@ -304,20 +316,38 @@ function useChat(tts, panelOpenRef) {
 function useRealtimeVoice() {
   const [status, setStatus] = useState('idle'); // idle | connecting | listening | speaking | error
   const [errorMsg, setErrorMsg] = useState('');
+  const [draftOrder, setDraftOrder] = useState(() => createEmptyOrderDraft());
+  const [lastOrderResult, setLastOrderResult] = useState(null);
   const pcRef = useRef(null);
   const dcRef = useRef(null);
   const audioElRef = useRef(null);
+  const baseMicStreamRef = useRef(null);
   const streamRef = useRef(null);
   const startingRef = useRef(false);
   const micMutedRef = useRef(false);
   const assistantSpeakingRef = useRef(false);
+  const assistantSpeechStartedAtRef = useRef(0);
   const micRestoreTimerRef = useRef(null);
   const idleTimerRef = useRef(null);
   const autoCloseTimerRef = useRef(null);
+  const prewarmTimerRef = useRef(null);
+  const micPrimePromiseRef = useRef(null);
   const sessionTokenRef = useRef(0);
   const closingReasonRef = useRef('');
   const pendingCloseReasonRef = useRef('');
   const pendingSummaryCloseRef = useRef(false);
+  const draftOrderRef = useRef(createEmptyOrderDraft());
+  const lastBargeInAtRef = useRef(0);
+  const dcHandlersRef = useRef(null);
+  const pcHandlersRef = useRef(null);
+  const localSpeechMonitorRef = useRef({
+    context: null,
+    source: null,
+    analyser: null,
+    frameId: 0,
+    data: null,
+    speechFrames: 0,
+  });
 
   const clearMicRestoreTimer = useCallback(() => {
     if (micRestoreTimerRef.current) {
@@ -337,6 +367,13 @@ function useRealtimeVoice() {
     if (autoCloseTimerRef.current) {
       clearTimeout(autoCloseTimerRef.current);
       autoCloseTimerRef.current = null;
+    }
+  }, []);
+
+  const clearPrewarmTimer = useCallback(() => {
+    if (prewarmTimerRef.current) {
+      clearTimeout(prewarmTimerRef.current);
+      prewarmTimerRef.current = null;
     }
   }, []);
 
@@ -379,6 +416,35 @@ function useRealtimeVoice() {
     return ['gracias', 'muchas gracias', 'listo', 'ok listo', 'bueno listo', 'dale listo'].includes(normalized);
   }, [normalizeRealtimeText]);
 
+  const isDraftCommitTranscript = useCallback((value = '') => {
+    const normalized = normalizeRealtimeText(value);
+    if (!normalized) return false;
+
+    const commitPhrases = [
+      'listo',
+      'ok listo',
+      'bueno listo',
+      'dale listo',
+      'eso es todo',
+      'eso seria todo',
+      'solamente eso',
+      'solo eso',
+      'nada mas',
+      'mas nada',
+      'confirma',
+      'confirmalo',
+      'confirmamelo',
+      'confirma pedido',
+      'confirma el pedido',
+      'haz el pedido',
+      'hazlo',
+      'procesa el pedido',
+      'procesalo',
+    ];
+
+    return commitPhrases.some((phrase) => normalized === phrase || normalized.includes(phrase));
+  }, [normalizeRealtimeText]);
+
   const isFinalOrderSummaryTranscript = useCallback((value = '') => {
     const normalized = normalizeRealtimeText(value);
     if (!normalized) return false;
@@ -407,6 +473,171 @@ function useRealtimeVoice() {
     console.log(`[realtime] ${type}`, details);
   }, []);
 
+  const stopLocalSpeechMonitor = useCallback(() => {
+    const monitor = localSpeechMonitorRef.current;
+    if (monitor.frameId) {
+      cancelAnimationFrame(monitor.frameId);
+    }
+    if (monitor.source) {
+      try { monitor.source.disconnect(); } catch {}
+    }
+    if (monitor.analyser) {
+      try { monitor.analyser.disconnect(); } catch {}
+    }
+    if (monitor.context) {
+      try { monitor.context.close(); } catch {}
+    }
+    localSpeechMonitorRef.current = {
+      context: null,
+      source: null,
+      analyser: null,
+      frameId: 0,
+      data: null,
+      speechFrames: 0,
+    };
+  }, []);
+
+  const releaseBaseMicStream = useCallback((reason = 'release') => {
+    clearPrewarmTimer();
+    stopLocalSpeechMonitor();
+    const baseStream = baseMicStreamRef.current;
+    baseMicStreamRef.current = null;
+    if (baseStream) {
+      try { baseStream.getTracks().forEach((track) => track.stop()); } catch {}
+      console.log(`[realtime] mic.base.released (${reason})`);
+    }
+  }, [clearPrewarmTimer, stopLocalSpeechMonitor]);
+
+  const sendRealtimeEvent = useCallback((event) => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== 'open') {
+      console.warn('[realtime] dc.send.skipped', {
+        type: event?.type || 'unknown',
+        ready_state: dc?.readyState || 'missing',
+      });
+      return false;
+    }
+
+    try {
+      dc.send(JSON.stringify(event));
+      return true;
+    } catch (error) {
+      console.error('[realtime] dc.send.error', error);
+      return false;
+    }
+  }, []);
+
+  const replaceDraftOrder = useCallback((nextDraft) => {
+    draftOrderRef.current = nextDraft;
+    setDraftOrder(nextDraft);
+  }, []);
+
+  const applyDraftTurn = useCallback((parsedTurn) => {
+    if (!parsedTurn?.handled) {
+      return draftOrderRef.current;
+    }
+
+    const nextDraft = applyParsedTurnToDraft(draftOrderRef.current, parsedTurn);
+    replaceDraftOrder(nextDraft);
+
+    console.log('[realtime] draft.updated', {
+      customer_name: nextDraft.customer_name,
+      order_type: nextDraft.order_type,
+      items: nextDraft.items,
+      scheduled_for: nextDraft.scheduled_for,
+    });
+
+    return nextDraft;
+  }, [replaceDraftOrder]);
+
+  const sendCustomAssistantResponse = useCallback((text) => {
+    const message = String(text || '').trim();
+    if (!message) {
+      return false;
+    }
+
+    const sent = sendRealtimeEvent({
+      type: 'response.create',
+      response: {
+        conversation: 'none',
+        input: [],
+        output_modalities: ['audio'],
+        metadata: {
+          route: 'draft-local',
+        },
+        instructions: `Habla en español venezolano neutro, cálido y natural. Di exactamente este mensaje y no agregues nada más:\n${message}`,
+      },
+    });
+
+    console.log('[realtime] response.requested', {
+      route: 'draft-local',
+      sent,
+      text: message,
+    });
+
+    return sent;
+  }, [sendRealtimeEvent]);
+
+  const requestModelResponse = useCallback((source = 'manual') => {
+    const sent = sendRealtimeEvent({
+      type: 'response.create',
+    });
+
+    console.log('[realtime] response.requested', {
+      route: 'model-manual',
+      source,
+      sent,
+    });
+
+    return sent;
+  }, [sendRealtimeEvent]);
+
+  const formatOrderTotal = useCallback((value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return String(value || '0');
+    }
+    return parsed.toFixed(2);
+  }, []);
+
+  const hasDraftItems = useCallback((draft) => Array.isArray(draft?.items) && draft.items.length > 0, []);
+  const isDraftReadyForSubmit = useCallback((draft) => (
+    hasDraftItems(draft) &&
+    Boolean(String(draft?.customer_name || '').trim()) &&
+    Boolean(String(draft?.order_type || '').trim())
+  ), [hasDraftItems]);
+
+  const submitDraftOrder = useCallback(async (draft) => {
+    const payload = {
+      customer_name: draft.customer_name,
+      notes: draft.notes,
+      order_type: draft.order_type,
+      scheduled_for: draft.scheduled_for,
+      items: draft.items.map((item) => ({
+        name: item.name,
+        quantity: item.quantity,
+        notes: item.notes || '',
+      })),
+    };
+
+    const res = await fetch('/api/orders/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {}
+
+    if (!res.ok) {
+      throw new Error(data?.error || 'No se pudo registrar el pedido');
+    }
+
+    return data;
+  }, []);
+
   const setMicMuted = useCallback((muted, reason) => {
     const stream = streamRef.current;
     if (!stream) return;
@@ -422,29 +653,67 @@ function useRealtimeVoice() {
     console.log(`[realtime] mic.${muted ? 'muted' : 'unmuted'} (${reason})`);
   }, []);
 
-  const cleanup = useCallback(() => {
+  const detachSessionListeners = useCallback(() => {
+    const dcHandlers = dcHandlersRef.current;
+    if (dcHandlers?.dc) {
+      try { dcHandlers.dc.removeEventListener('open', dcHandlers.open); } catch {}
+      try { dcHandlers.dc.removeEventListener('message', dcHandlers.message); } catch {}
+      try { dcHandlers.dc.removeEventListener('error', dcHandlers.error); } catch {}
+    }
+    dcHandlersRef.current = null;
+
+    const pcHandlers = pcHandlersRef.current;
+    if (pcHandlers?.pc) {
+      if (pcHandlers.pc.ontrack === pcHandlers.ontrack) {
+        pcHandlers.pc.ontrack = null;
+      }
+      if (pcHandlers.pc.onconnectionstatechange === pcHandlers.onconnectionstatechange) {
+        pcHandlers.pc.onconnectionstatechange = null;
+      }
+    }
+    pcHandlersRef.current = null;
+  }, []);
+
+  const cleanup = useCallback((reason = 'cleanup') => {
     sessionTokenRef.current += 1;
     startingRef.current = false;
     clearMicRestoreTimer();
     clearIdleTimer();
     clearAutoCloseTimer();
+    clearPrewarmTimer();
     assistantSpeakingRef.current = false;
+    assistantSpeechStartedAtRef.current = 0;
     micMutedRef.current = false;
     pendingCloseReasonRef.current = '';
     pendingSummaryCloseRef.current = false;
-    if (dcRef.current) { try { dcRef.current.close(); } catch {} dcRef.current = null; }
-    if (pcRef.current) { try { pcRef.current.close(); } catch {} pcRef.current = null; }
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
-    if (audioElRef.current) {
-      try { audioElRef.current.pause(); audioElRef.current.srcObject = null; } catch {}
-      audioElRef.current = null;
-    }
-  }, [clearAutoCloseTimer, clearIdleTimer, clearMicRestoreTimer]);
+    detachSessionListeners();
+
+    const dc = dcRef.current;
+    const pc = pcRef.current;
+    const stream = streamRef.current;
+    const audioEl = audioElRef.current;
+
+    dcRef.current = null;
+    pcRef.current = null;
+    streamRef.current = null;
+    audioElRef.current = null;
+
+    disposeSessionArtifacts(pc, dc, stream, audioEl);
+    releaseBaseMicStream(reason);
+  }, [
+    clearAutoCloseTimer,
+    clearIdleTimer,
+    clearMicRestoreTimer,
+    clearPrewarmTimer,
+    detachSessionListeners,
+    disposeSessionArtifacts,
+    releaseBaseMicStream,
+  ]);
 
   const stopSession = useCallback((reason = 'manual stop') => {
     closingReasonRef.current = reason;
     console.log(`[realtime] session.close (${reason})`);
-    cleanup();
+    cleanup(reason);
     setStatus('idle');
     setErrorMsg('');
   }, [cleanup]);
@@ -477,6 +746,7 @@ function useRealtimeVoice() {
   const muteMicForAssistant = useCallback((reason) => {
     clearMicRestoreTimer();
     assistantSpeakingRef.current = true;
+    assistantSpeechStartedAtRef.current = Date.now();
     if (!micMutedRef.current) {
       setMicMuted(true, reason);
     }
@@ -485,6 +755,7 @@ function useRealtimeVoice() {
   const restoreMicAfterAssistant = useCallback((reason) => {
     clearMicRestoreTimer();
     assistantSpeakingRef.current = false;
+    assistantSpeechStartedAtRef.current = 0;
     if (micMutedRef.current) {
       setMicMuted(false, reason);
     }
@@ -500,6 +771,249 @@ function useRealtimeVoice() {
       restoreMicAfterAssistant(reason);
     }, delayMs);
   }, [clearMicRestoreTimer, restoreMicAfterAssistant]);
+
+  const interruptAssistantForBargeIn = useCallback((source = 'local-vad') => {
+    if (!assistantSpeakingRef.current || !pcRef.current) {
+      return false;
+    }
+
+    const now = Date.now();
+    if (now - lastBargeInAtRef.current < REALTIME_BARGE_IN_COOLDOWN_MS) {
+      return false;
+    }
+
+    lastBargeInAtRef.current = now;
+    pendingCloseReasonRef.current = '';
+    pendingSummaryCloseRef.current = false;
+    clearAutoCloseTimer();
+    clearIdleTimer();
+
+    console.log('[realtime] barge_in.triggered', { source });
+    sendRealtimeEvent({ type: 'response.cancel' });
+    sendRealtimeEvent({ type: 'output_audio_buffer.clear' });
+    restoreMicAfterAssistant(`barge-in:${source}`);
+    setStatus('listening');
+    scheduleIdleTimeout(`barge-in:${source}`);
+    return true;
+  }, [clearAutoCloseTimer, clearIdleTimer, restoreMicAfterAssistant, scheduleIdleTimeout, sendRealtimeEvent]);
+
+  const startLocalSpeechMonitor = useCallback((baseStream) => {
+    if (typeof window === 'undefined' || !baseStream) {
+      return;
+    }
+
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      return;
+    }
+
+    stopLocalSpeechMonitor();
+
+    try {
+      const context = new AudioContextCtor();
+      const source = context.createMediaStreamSource(baseStream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.15;
+      source.connect(analyser);
+
+      const data = new Uint8Array(analyser.fftSize);
+      localSpeechMonitorRef.current = {
+        context,
+        source,
+        analyser,
+        frameId: 0,
+        data,
+        speechFrames: 0,
+      };
+
+      const tick = () => {
+        const monitor = localSpeechMonitorRef.current;
+        if (monitor.context !== context || !monitor.analyser || !monitor.data) {
+          return;
+        }
+
+        monitor.analyser.getByteTimeDomainData(monitor.data);
+
+        let peak = 0;
+        let sumSquares = 0;
+        for (let index = 0; index < monitor.data.length; index += 1) {
+          const sample = (monitor.data[index] - 128) / 128;
+          const absSample = Math.abs(sample);
+          if (absSample > peak) peak = absSample;
+          sumSquares += sample * sample;
+        }
+
+        const rms = Math.sqrt(sumSquares / monitor.data.length);
+        const speechScore = Math.max(peak, rms * 2.5);
+        const canBargeIn =
+          assistantSpeakingRef.current &&
+          !closingReasonRef.current &&
+          pcRef.current &&
+          Date.now() - assistantSpeechStartedAtRef.current >= REALTIME_BARGE_IN_MIN_RESPONSE_MS;
+
+        if (canBargeIn && speechScore >= REALTIME_BARGE_IN_THRESHOLD) {
+          monitor.speechFrames += 1;
+        } else {
+          monitor.speechFrames = Math.max(0, monitor.speechFrames - 1);
+        }
+
+        if (monitor.speechFrames >= REALTIME_BARGE_IN_FRAMES) {
+          monitor.speechFrames = 0;
+          interruptAssistantForBargeIn('local-vad');
+        }
+
+        monitor.frameId = requestAnimationFrame(tick);
+      };
+
+      if (typeof context.resume === 'function') {
+        context.resume().catch(() => {});
+      }
+
+      tick();
+      console.log('[realtime] mic.monitor.started');
+    } catch (error) {
+      console.warn('[realtime] mic.monitor.failed', error);
+      stopLocalSpeechMonitor();
+    }
+  }, [interruptAssistantForBargeIn, stopLocalSpeechMonitor]);
+
+  const primeMicrophone = useCallback(async (reason = 'prepare') => {
+    clearPrewarmTimer();
+
+    const existingStream = baseMicStreamRef.current;
+    if (existingStream && existingStream.active) {
+      return existingStream;
+    }
+
+    if (micPrimePromiseRef.current) {
+      return micPrimePromiseRef.current;
+    }
+
+    micPrimePromiseRef.current = navigator.mediaDevices.getUserMedia(REALTIME_MIC_CONSTRAINTS)
+      .then((stream) => {
+        baseMicStreamRef.current = stream;
+        startLocalSpeechMonitor(stream);
+        console.log(`[realtime] mic.base.ready (${reason})`);
+        return stream;
+      })
+      .finally(() => {
+        micPrimePromiseRef.current = null;
+      });
+
+    return micPrimePromiseRef.current;
+  }, [clearPrewarmTimer, startLocalSpeechMonitor]);
+
+  const prepare = useCallback(async () => {
+    if (pcRef.current || startingRef.current) {
+      return;
+    }
+
+    try {
+      await primeMicrophone('prepare');
+      clearPrewarmTimer();
+      prewarmTimerRef.current = setTimeout(() => {
+        releaseBaseMicStream('prewarm-timeout');
+      }, REALTIME_MIC_PREWARM_RELEASE_MS);
+      console.log('[realtime] mic.prewarm.scheduled-release');
+    } catch (error) {
+      console.warn('[realtime] mic.prewarm.failed', error);
+    }
+  }, [clearPrewarmTimer, primeMicrophone, releaseBaseMicStream]);
+
+  const handleDraftTurn = useCallback(async (parsedTurn) => {
+    if (!parsedTurn?.handled) {
+      return;
+    }
+
+    clearAutoCloseTimer();
+    clearIdleTimer();
+    pendingCloseReasonRef.current = '';
+    pendingSummaryCloseRef.current = false;
+
+    const nextDraft = applyDraftTurn(parsedTurn);
+    console.log('[realtime] draft.confirm.path', {
+      action: parsedTurn.action,
+      ready_for_submit: isDraftReadyForSubmit(nextDraft),
+      has_items: hasDraftItems(nextDraft),
+    });
+
+    if (parsedTurn.action === 'clarify' || parsedTurn.action === 'update') {
+      if (!sendCustomAssistantResponse(parsedTurn.replyText || 'Listo.')) {
+        restoreMicAfterAssistant('draft.reply.failed');
+        scheduleIdleTimeout('draft.reply.failed');
+      }
+      return;
+    }
+
+    if (parsedTurn.action !== 'confirm') {
+      return;
+    }
+
+    if (!nextDraft.items.length) {
+      if (!sendCustomAssistantResponse('Todavía no tengo productos en tu pedido. Dime qué quieres pedir.')) {
+        restoreMicAfterAssistant('draft.confirm.missing-items');
+      }
+      scheduleIdleTimeout('draft.confirm.missing-items');
+      return;
+    }
+
+    if (!nextDraft.customer_name) {
+      if (!sendCustomAssistantResponse('Antes de confirmarlo, dime a nombre de quién va el pedido.')) {
+        restoreMicAfterAssistant('draft.confirm.missing-name');
+      }
+      scheduleIdleTimeout('draft.confirm.missing-name');
+      return;
+    }
+
+    if (!nextDraft.order_type) {
+      if (!sendCustomAssistantResponse('Antes de confirmarlo, dime si es para llevar, delivery o para comer aquí.')) {
+        restoreMicAfterAssistant('draft.confirm.missing-order-type');
+      }
+      scheduleIdleTimeout('draft.confirm.missing-order-type');
+      return;
+    }
+
+    try {
+      console.log('[realtime] order.create.request', {
+        customer_name: nextDraft.customer_name,
+        order_type: nextDraft.order_type,
+        items: nextDraft.items,
+      });
+
+      const result = await submitDraftOrder(nextDraft);
+      setLastOrderResult(result);
+      replaceDraftOrder(createEmptyOrderDraft());
+
+      console.log('[realtime] order.create.success', result);
+
+      if (!sendCustomAssistantResponse(
+        `Perfecto, tu pedido quedó registrado con el ticket ${result.ticket_code} por ${formatOrderTotal(result.total)} dólares.`,
+      )) {
+        restoreMicAfterAssistant('order.create.success.reply.failed');
+        scheduleIdleTimeout('order.create.success.reply.failed');
+      }
+    } catch (error) {
+      console.error('[realtime] order.create.error', error);
+
+      if (!sendCustomAssistantResponse('No pude registrar el pedido en este momento. Podemos intentarlo de nuevo.')) {
+        restoreMicAfterAssistant('order.create.error.reply.failed');
+        scheduleIdleTimeout('order.create.error.reply.failed');
+      }
+    }
+  }, [
+    applyDraftTurn,
+    clearAutoCloseTimer,
+    clearIdleTimer,
+    formatOrderTotal,
+    hasDraftItems,
+    isDraftReadyForSubmit,
+    replaceDraftOrder,
+    restoreMicAfterAssistant,
+    scheduleIdleTimeout,
+    sendCustomAssistantResponse,
+    submitDraftOrder,
+  ]);
 
   const stop = useCallback(() => {
     stopSession('manual stop');
@@ -539,10 +1053,14 @@ function useRealtimeVoice() {
     try {
       const isSessionActive = () => isCurrentSessionToken(sessionToken) && !closingReasonRef.current;
 
-      // 1. Request microphone before minting a short-lived client secret.
-      const stream = await navigator.mediaDevices.getUserMedia(REALTIME_MIC_CONSTRAINTS);
+      clearPrewarmTimer();
+
+      // 1. Reuse or prewarm the base microphone before opening the session.
+      const baseStream = await primeMicrophone('start');
+      const stream = typeof baseStream.clone === 'function' ? baseStream.clone() : baseStream;
       if (!isSessionActive()) {
         disposeSessionArtifacts(null, null, stream, null);
+        releaseBaseMicStream('aborted-before-start');
         return;
       }
       streamRef.current = stream;
@@ -559,7 +1077,7 @@ function useRealtimeVoice() {
       const audioEl = new Audio();
       audioEl.autoplay = true;
       audioElRef.current = audioEl;
-      pc.ontrack = (e) => {
+      const handleTrack = (e) => {
         if (!isSessionActive()) return;
         if (e.track.kind === 'audio' && audioElRef.current) {
           if (audioElRef.current.srcObject !== e.streams[0]) {
@@ -570,6 +1088,7 @@ function useRealtimeVoice() {
           }
         }
       };
+      pc.ontrack = handleTrack;
 
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
@@ -577,14 +1096,15 @@ function useRealtimeVoice() {
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
 
-      dc.addEventListener('open', () => {
+      const handleDataChannelOpen = () => {
         if (!isSessionActive()) return;
+        logRealtimeEvent('datachannel.open');
         startingRef.current = false;
         setStatus('listening');
         scheduleIdleTimeout('datachannel.open');
-      });
+      };
 
-      dc.addEventListener('message', (e) => {
+      const handleDataChannelMessage = (e) => {
         if (!isSessionActive()) return;
         try {
           const evt = JSON.parse(e.data);
@@ -602,7 +1122,9 @@ function useRealtimeVoice() {
             case 'input_audio_buffer.speech_started':
               logRealtimeEvent('input_audio_buffer.speech_started', evt);
               if (assistantSpeakingRef.current) {
-                console.log('[realtime] input_audio_buffer.speech_started ignored while assistant is speaking');
+                if (!interruptAssistantForBargeIn('server-vad')) {
+                  console.log('[realtime] input_audio_buffer.speech_started ignored while assistant is speaking');
+                }
                 break;
               }
               clearAutoCloseTimer();
@@ -613,15 +1135,62 @@ function useRealtimeVoice() {
             case 'conversation.item.input_audio_transcription.completed':
               logRealtimeEvent('conversation.item.input_audio_transcription.completed', evt);
               if (evt.transcript) {
+                const parsedTurn = parseOrderDraftTurn({
+                  transcript: evt.transcript,
+                  draft: draftOrderRef.current,
+                  catalog: MENU_ITEM_CATALOG,
+                });
                 const finalIntent = isFinalIntentTranscript(evt.transcript);
-                pendingCloseReasonRef.current = finalIntent ? 'user final intent' : '';
+                const commitIntent = isDraftCommitTranscript(evt.transcript);
+                const draftAfterTurn = parsedTurn.handled
+                  ? applyParsedTurnToDraft(draftOrderRef.current, parsedTurn)
+                  : draftOrderRef.current;
+                const draftHasItems = hasDraftItems(draftAfterTurn);
+                const shouldForceConfirm =
+                  draftHasItems &&
+                  (commitIntent || (parsedTurn.handled && parsedTurn.action === 'confirm'));
+                const effectiveTurn = shouldForceConfirm
+                  ? {
+                      handled: true,
+                      action: 'confirm',
+                      changes: parsedTurn.handled ? parsedTurn.changes : {},
+                      replyText: null,
+                    }
+                  : parsedTurn;
+
+                pendingCloseReasonRef.current = finalIntent && !shouldForceConfirm && !draftHasItems ? 'user final intent' : '';
                 pendingSummaryCloseRef.current = false;
                 clearAutoCloseTimer();
                 console.log('[realtime] user.transcript', {
                   transcript: evt.transcript,
+                  draft_action: effectiveTurn.handled ? effectiveTurn.action : null,
                   final_intent: finalIntent,
+                  commit_intent: commitIntent,
+                  forced_confirm: shouldForceConfirm,
+                  draft_has_items: draftHasItems,
+                  draft_ready: isDraftReadyForSubmit(draftAfterTurn),
                 });
                 scheduleIdleTimeout('user.transcript');
+                if (effectiveTurn.handled) {
+                  console.log('[realtime] draft_action', effectiveTurn.action);
+                  console.log('[realtime] transcript.route', {
+                    route: 'draft-local',
+                    draft_action: effectiveTurn.action,
+                    forced_confirm: shouldForceConfirm,
+                    transcript: evt.transcript,
+                  });
+                  void handleDraftTurn(effectiveTurn);
+                  break;
+                }
+                console.log('[realtime] transcript.route', {
+                  route: 'model-manual',
+                  draft_action: null,
+                  transcript: evt.transcript,
+                });
+                if (!requestModelResponse('conversation.item.input_audio_transcription.completed')) {
+                  restoreMicAfterAssistant('response.request.failed');
+                  scheduleIdleTimeout('response.request.failed');
+                }
               }
               break;
             case 'response.created':
@@ -725,17 +1294,27 @@ function useRealtimeVoice() {
               break;
           }
         } catch {}
-      });
+      };
 
-      dc.addEventListener('error', () => {
+      const handleDataChannelError = () => {
         if (!isSessionActive()) return;
         if (closingReasonRef.current) return;
         restoreMicAfterAssistant('datachannel.error');
         setErrorMsg('Error en el canal de datos');
         setStatus('error');
-      });
+      };
 
-      pc.onconnectionstatechange = () => {
+      dcHandlersRef.current = {
+        dc,
+        open: handleDataChannelOpen,
+        message: handleDataChannelMessage,
+        error: handleDataChannelError,
+      };
+      dc.addEventListener('open', handleDataChannelOpen);
+      dc.addEventListener('message', handleDataChannelMessage);
+      dc.addEventListener('error', handleDataChannelError);
+
+      const handleConnectionStateChange = () => {
         if (!isSessionActive()) return;
         if (pc.connectionState === 'closed' && closingReasonRef.current) {
           console.log(`[realtime] pc.closed (${closingReasonRef.current})`);
@@ -744,8 +1323,14 @@ function useRealtimeVoice() {
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           setErrorMsg('Conexión WebRTC perdida');
           setStatus('error');
-          cleanup();
+          cleanup(`pc.${pc.connectionState}`);
         }
+      };
+      pc.onconnectionstatechange = handleConnectionStateChange;
+      pcHandlersRef.current = {
+        pc,
+        ontrack: handleTrack,
+        onconnectionstatechange: handleConnectionStateChange,
       };
 
       // 5. Prepare the offer first, then mint the client secret right before the SDP POST.
@@ -760,6 +1345,7 @@ function useRealtimeVoice() {
         const ephemeralKey = await createClientSecret();
         if (!isSessionActive()) {
           disposeSessionArtifacts(pc, dc, stream, audioEl);
+          releaseBaseMicStream('aborted-before-sdp');
           return;
         }
         const sdpRes = await fetch('https://api.openai.com/v1/realtime/calls', {
@@ -790,6 +1376,7 @@ function useRealtimeVoice() {
       // 6. Set remote description with OpenAI's SDP answer.
       if (!isSessionActive()) {
         disposeSessionArtifacts(pc, dc, stream, audioEl);
+        releaseBaseMicStream('aborted-before-remote-description');
         return;
       }
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
@@ -807,22 +1394,31 @@ function useRealtimeVoice() {
     cleanup,
     clearAutoCloseTimer,
     clearIdleTimer,
+    clearPrewarmTimer,
     createClientSecret,
     disposeSessionArtifacts,
+    handleDraftTurn,
+    hasDraftItems,
+    interruptAssistantForBargeIn,
     isCurrentSessionToken,
+    isDraftCommitTranscript,
     isFinalIntentTranscript,
     isFinalOrderSummaryTranscript,
+    isDraftReadyForSubmit,
     logRealtimeEvent,
     muteMicForAssistant,
+    primeMicrophone,
+    requestModelResponse,
+    releaseBaseMicStream,
     restoreMicAfterAssistant,
     scheduleIdleTimeout,
     scheduleMicRestore,
     scheduleSessionClose,
   ]);
 
-  useEffect(() => () => cleanup(), [cleanup]);
+  useEffect(() => () => cleanup('unmount'), [cleanup]);
 
-  return { status, errorMsg, start, stop };
+  return { status, errorMsg, start, stop, prepare, draftOrder, lastOrderResult };
 }
 
 // ─── SPLASH ──────────────────────────────────────────────────
@@ -863,7 +1459,7 @@ function Splash({ onEnter }) {
 }
 
 // ─── VOICE ORB ────────────────────────────────────────────────
-function VoiceOrb({ status, onStart, onStop }) {
+function VoiceOrb({ status, onStart, onStop, onPrepare }) {
   const active = status === 'connecting' || status === 'listening' || status === 'speaking';
 
   const orbAnimation = {
@@ -912,6 +1508,7 @@ function VoiceOrb({ status, onStart, onStop }) {
       {/* Orb wrapper */}
       <div
         style={{ position: 'relative', width: 160, height: 160, cursor: 'pointer' }}
+        onMouseDown={() => { onPrepare?.(); }}
         onClick={active ? onStop : onStart}
         role="button"
         aria-label={active ? 'Detener asistente de voz' : 'Iniciar asistente de voz'}
@@ -1014,7 +1611,8 @@ function VoiceOrb({ status, onStart, onStop }) {
 
       {/* Explicit stop button when active */}
       {active && (
-        <button onClick={(e) => { e.stopPropagation(); onStop(); }} style={{
+        <button onClick={(e) => { e.stopPropagation(); onStop(); }}
+          style={{
           marginTop: 16, padding: '9px 28px', borderRadius: 24,
           border: `1px solid ${T.border}`, background: T.elevated,
           color: T.textSec, fontSize: 11, fontFamily: "'DM Sans', sans-serif",
@@ -1242,7 +1840,7 @@ function Card({ item, idx, onAsk }) {
 export default function Home() {
   const [splash, setSplash] = useState(true);
   const [activeCat, setActiveCat] = useState('hamburguesas');
-  const { status, errorMsg, start, stop } = useRealtimeVoice();
+  const { status, errorMsg, start, stop, prepare } = useRealtimeVoice();
 
   // Clicking "Preguntar" on a card starts the voice session
   const askAbout = useCallback(() => {
@@ -1296,7 +1894,7 @@ export default function Home() {
         <p style={{ fontSize: 11, color: T.textSec, letterSpacing: 3, textTransform: 'uppercase', marginBottom: 40 }}>
           Asistente de Voz Premium
         </p>
-        <VoiceOrb status={status} onStart={start} onStop={stop} />
+        <VoiceOrb status={status} onStart={start} onStop={stop} onPrepare={prepare} />
         {errorMsg && (
           <p style={{ fontSize: 11, color: '#ff6b6b', marginTop: 16, textAlign: 'center', maxWidth: 280, lineHeight: 1.5 }}>
             {errorMsg}
